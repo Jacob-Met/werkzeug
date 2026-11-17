@@ -781,6 +781,93 @@ def test_non_string_parts():
     assert a.build("foo", {"foo": 42}) == "/42"
 
 
+@pytest.mark.parametrize("noise_count", (0, 1, 4))
+@pytest.mark.parametrize("first", ("any", "string"))
+def test_dynamic_priority_is_not_changed_by_unrelated_prefix(
+    first: str, noise_count: int
+) -> None:
+    routes = [
+        r.Rule(f"/<string:other>/unrelated-{n}", endpoint=f"unrelated-{n}")
+        for n in range(noise_count)
+    ]
+    any_rule = r.Rule("/<any(foo, bar):value>", endpoint="any")
+    string_rule = r.Rule("/<string:value>", endpoint="string")
+    routes.extend(
+        (any_rule, string_rule) if first == "any" else (string_rule, any_rule)
+    )
+    adapter = r.Map(routes).bind("example.org", "/")
+    assert adapter.match("/foo")[0] == first
+    assert adapter.match("/bar")[0] == first
+    assert adapter.match("/not-an-any")[0] == "string"
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+@pytest.mark.parametrize("noise_count", (0, 4))
+def test_dynamic_priority_uses_later_static_specificity(
+    reverse: bool, noise_count: int
+) -> None:
+    routes = [
+        r.Rule("/<string:value>/<path:rest>", endpoint="broad"),
+        r.Rule("/<any(foo, bar):value>/bar", endpoint="specific"),
+    ]
+    if reverse:
+        routes.reverse()
+    routes[:0] = [
+        r.Rule(f"/<string:other>/unrelated-{n}", endpoint=f"unrelated-{n}")
+        for n in range(noise_count)
+    ]
+    adapter = r.Map(routes).bind("example.org", "/")
+    assert adapter.match("/foo/bar")[0] == "specific"
+    assert adapter.match("/foo/else")[0] == "broad"
+    assert adapter.match("/else/bar")[0] == "broad"
+
+
+def test_dynamic_weight_still_overrides_registration_order() -> None:
+    adapter = r.Map(
+        [
+            r.Rule("/<string:value>", endpoint="string"),
+            r.Rule("/<int:value>", endpoint="integer"),
+        ]
+    ).bind("example.org", "/")
+    assert adapter.match("/42")[0] == "integer"
+    assert adapter.match("/text")[0] == "string"
+
+
+@pytest.mark.parametrize("noise_count", (0, 3))
+def test_dynamic_priority_does_not_hide_uuid_specificity(noise_count: int) -> None:
+    routes = [
+        r.Rule(f"/<string:other>/unrelated-{n}", endpoint=f"unused-{n}")
+        for n in range(noise_count)
+    ]
+    routes.extend(
+        (
+            r.Rule("/<string:text>/<uuid:uid>", endpoint="uuid-second"),
+            r.Rule("/<uuid:uid>/<string:text>", endpoint="uuid-first"),
+            r.Rule("/<uuid:uid>", endpoint="uuid-single"),
+            r.Rule("/<string:text>", endpoint="string-single"),
+        )
+    )
+    adapter = r.Map(routes).bind("example.org", "/")
+    uid = "00000000-0000-0000-0000-000000000000"
+    assert adapter.match(f"/{uid}/{uid}")[0] == "uuid-second"
+    assert adapter.match(f"/{uid}/not-a-uuid")[0] == "uuid-first"
+    assert adapter.match(f"/{uid}")[0] == "uuid-single"
+    assert adapter.match("/not-a-uuid")[0] == "string-single"
+
+
+def test_equal_weight_dynamic_routes_respect_methods() -> None:
+    adapter = r.Map(
+        (
+            r.Rule("/<any(foo, bar):value>", endpoint="post", methods={"POST"}),
+            r.Rule("/<string:value>", endpoint="get", methods={"GET"}),
+        )
+    ).bind("example.org", "/")
+    assert adapter.match("/foo", method="GET")[0] == "get"
+    assert adapter.match("/foo", method="POST")[0] == "post"
+    with pytest.raises(MethodNotAllowed):
+        adapter.match("/foo", method="PUT")
+
+
 def test_complex_routing_rules():
     m = r.Map(
         [

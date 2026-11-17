@@ -12,6 +12,7 @@ from .exceptions import RequestAliasRedirect
 from .exceptions import RequestPath
 from .rules import Rule
 from .rules import RulePart
+from .rules import Weighting
 
 
 class SlashRequired(Exception):
@@ -27,6 +28,7 @@ class State:
     """
 
     dynamic: list[tuple[RulePart, State]] = field(default_factory=list)
+    dynamic_has_ties: bool = False
     rules: list[Rule] = field(default_factory=list)
     static: dict[str, State] = field(default_factory=dict)
 
@@ -35,6 +37,10 @@ class StateMachineMatcher:
     def __init__(self, merge_slashes: bool) -> None:
         self._root = State()
         self.merge_slashes = merge_slashes
+        # Record precedence for completed routes rather than trie edges. Two
+        # different converters with equal weight can share prefixes with
+        # unrelated rules, which must not reorder the routes they match.
+        self._rule_rank: dict[int, tuple[tuple[tuple[bool, Weighting], ...], int]] = {}
 
     def add(self, rule: Rule) -> None:
         state = self._root
@@ -57,6 +63,10 @@ class StateMachineMatcher:
                 raise DuplicateRuleError(existing, rule)
 
         state.rules.append(rule)
+        self._rule_rank[id(rule)] = (
+            tuple((not part.static, part.weight) for part in rule._parts),
+            len(self._rule_rank),
+        )
 
     def update(self) -> None:
         # For every state the dynamic transitions should be sorted by
@@ -65,6 +75,10 @@ class StateMachineMatcher:
 
         def _update_state(state: State) -> None:
             state.dynamic.sort(key=lambda entry: entry[0].weight)
+            state.dynamic_has_ties = any(
+                left[0].weight == right[0].weight
+                for left, right in zip(state.dynamic, state.dynamic[1:], strict=False)
+            )
             for new_state in state.static.values():
                 _update_state(new_state)
             for _, new_state in state.dynamic:
@@ -122,9 +136,18 @@ class StateMachineMatcher:
                 rv = _match(state.static[part], parts[1:], values)
                 if rv is not None:
                     return rv
-            # No match via the static transitions, so try the dynamic
-            # ones.
+            # No match via a static transition. Different dynamic
+            # converters with the same weight can both match the path, even
+            # when their states contain unrelated, differently ordered rules.
+            # Compare completed routes, using later static parts for
+            # specificity and registration order only for exact ties.
+            best: tuple[Rule, list[str]] | None = None
+            best_weight: Weighting | None = None
             for test_part, new_state in state.dynamic:
+                # update() sorts transitions by weight. Once a matching
+                # route is found, heavier transitions cannot improve it.
+                if best_weight is not None and test_part.weight > best_weight:
+                    break
                 target = part
                 remaining = parts[1:]
                 # A final part indicates a transition that always
@@ -152,8 +175,18 @@ class StateMachineMatcher:
                     )
                     groups = [item[1] for item in converter_groups]
                     rv = _match(new_state, remaining, values + groups)
-                    if rv is not None:
+                    if rv is not None and not state.dynamic_has_ties:
                         return rv
+
+                    if rv is not None and (
+                        best is None
+                        or self._rule_rank[id(rv[0])] < self._rule_rank[id(best[0])]
+                    ):
+                        best = rv
+                        best_weight = test_part.weight
+
+            if best is not None:
+                return best
 
             # If there is no match and the only part left is a
             # trailing slash ("") consider rules that aren't
