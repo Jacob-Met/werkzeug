@@ -87,6 +87,10 @@ def test_decoder_data_start_with_different_newline_positions(
         events.append(decoder.next_event())
 
     expected = data_start if data_end == b"" else data_start + b"\r\nBCDE"
+    if data_end == b"" and expected.endswith(b"\r"):
+        # This CR may be the start of a delimiter split across reads.
+        # Keep it buffered until another byte disambiguates it.
+        expected = expected[:-1]
 
     assert events == [
         Preamble(data=b""),
@@ -180,3 +184,67 @@ Content-Type: text/plain; charset="UTF-8"
     for event in events:
         result += encoder.send_event(event)
     assert data == result
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"",
+        b"a",
+        b"a\r",
+        b"a\n",
+        b"a\r\n",
+        b"\r",
+        b"\n",
+        b"\r\n",
+        b"hello\r\nworld",
+        b"hello\r\n--WZBOUNDXworld",
+        b"hello\r--WZBOUNDXworld",
+        b"hello\n--WZBOUNDXworld",
+    ],
+)
+def test_decoder_preserves_data_across_all_boundary_splits(payload: bytes) -> None:
+    boundary = b"WZBOUND"
+    raw = (
+        b'--WZBOUND\r\nContent-Disposition: form-data; name="field"\r\n\r\n'
+        + payload
+        + b"\r\n--WZBOUND--\r\n"
+    )
+
+    def parse(chunks: list[bytes]) -> bytes:
+        decoder = MultipartDecoder(boundary)
+        result = bytearray()
+        chunk_index = 0
+        ended = False
+
+        while True:
+            event = decoder.next_event()
+
+            if isinstance(event, NeedData):
+                if chunk_index < len(chunks):
+                    decoder.receive_data(chunks[chunk_index])
+                    chunk_index += 1
+                elif not ended:
+                    decoder.receive_data(None)
+                    ended = True
+                else:
+                    pytest.fail("Decoder stalled after end of input")
+            elif isinstance(event, Data):
+                result.extend(event.data)
+            elif isinstance(event, Epilogue):
+                return bytes(result)
+
+    assert parse([raw]) == payload
+
+    # Cover every offset where a complete frame can be split, rather than
+    # only the chunk-size alignment that triggered this regression.
+    for cut in range(1, len(raw)):
+        assert parse([raw[:cut], raw[cut:]]) == payload, (
+            f"incorrect data at split {cut} for {payload!r}"
+        )
+
+    for chunk_size in [1, 2, 3, 4, 5, 7, 8, 13, 16]:
+        chunks = [raw[i : i + chunk_size] for i in range(0, len(raw), chunk_size)]
+        assert parse(chunks) == payload, (
+            f"incorrect data with chunks of size {chunk_size} for {payload!r}"
+        )

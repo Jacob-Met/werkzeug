@@ -414,3 +414,20 @@ def test_multipart_max_form_memory_size() -> None:
 
     with pytest.raises(RequestEntityTooLarge):
         parser.parse(io.BytesIO(data), b"bound", None)
+
+
+@pytest.mark.parametrize("split", range(1, 16))
+def test_multipart_file_boundary_across_default_buffer(split: int) -> None:
+    header = (
+        b'--WZBOUND\r\nContent-Disposition: form-data; name="upload"; '
+        b'filename="sample.bin"\r\nContent-Type: application/octet-stream\r\n\r\n'
+    )
+    trailer = b"\r\n--WZBOUND--\r\n"
+    payload = b"x" * (65536 - len(header) - split)
+    raw = header + payload + trailer
+
+    with Request.from_values(
+        data=raw, method="POST", content_type="multipart/form-data; boundary=WZBOUND"
+    ) as request:
+        assert not request.form
+        assert request.files["upload"].read() == payload

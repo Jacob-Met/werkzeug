@@ -3,6 +3,9 @@
 Version 3.2.0
 -------------
 
+-   Avoid appending a stray carriage return to multipart fields or files when
+    a boundary is split across input chunks. :issue:`3285`
+
 -   Drop support for Python 3.9 and 3.10. :pr:`3098`
 -   Remove previous deprecated code: :pr:`3099`
 

@@ -266,6 +266,14 @@ class MultipartDecoder:
                     self._last_partial_boundary_index(data[data_start:]) + data_start
                 )
             more_data = match is None
+
+        # CRLF may straddle this chunk. A trailing CR is still a
+        # candidate delimiter prefix even when the boundary scan has
+        # found an incomplete `--boundary` later in the buffer.
+        if more_data and data_end > data_start and data[data_end - 1] == 0x0D:
+            data_end -= 1
+            del_index -= 1
+
         return bytes(data[data_start:data_end]), del_index, more_data
 
     def _last_partial_boundary_index(self, data: bytes | bytearray) -> int:
