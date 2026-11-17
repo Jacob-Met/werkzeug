@@ -1000,6 +1000,86 @@ def test_nested_regex_groups():
     assert kwargs["end"] == "2023-02-16T23:46:36.266Z"
 
 
+def test_equal_weight_converters_preserve_unrelated_rule_precedence() -> None:
+    converters = {"dummy": r.BaseConverter}
+    old_rules = [
+        r.Rule("/<dummy:value>", endpoint="first"),
+        r.Rule("/<string:value>", endpoint="second"),
+    ]
+    for prefix in ([], [r.Rule("/<string:value>/other", endpoint="unrelated")]):
+        rule_map = r.Map(
+            [*prefix, *(rule.empty() for rule in old_rules)], converters=converters
+        )
+        adapter = rule_map.bind("example.org", "/")
+        assert adapter.match("/foo") == ("first", {"value": "foo"})
+        if prefix:
+            assert adapter.match("/foo/other") == ("unrelated", {"value": "foo"})
+
+
+def test_equal_weight_converters_prefer_deeper_static_rule() -> None:
+    rule_map = r.Map(
+        [
+            r.Rule("/<string:value>/<path:path>", endpoint="general"),
+            r.Rule("/<dummy:value>/bar", endpoint="specific"),
+        ],
+        converters={"dummy": r.BaseConverter},
+    )
+    adapter = rule_map.bind("example.org", "/")
+    assert adapter.match("/foo/bar") == ("specific", {"value": "foo"})
+    assert adapter.match("/foo/baz") == ("general", {"value": "foo", "path": "baz"})
+
+
+def test_equal_weight_any_converter_and_string_keep_registration_order() -> None:
+    rules = [
+        r.Rule("/<any(foo, bar):value>", endpoint="choice"),
+        r.Rule("/<string:value>", endpoint="string"),
+    ]
+    for prepended in ([], [r.Rule("/<string:value>/other", endpoint="other")]):
+        rule_map = r.Map([*prepended, *(rule.empty() for rule in rules)])
+        adapter = rule_map.bind("example.org", "/")
+        assert adapter.match("/foo") == ("choice", {"value": "foo"})
+        assert adapter.match("/baz") == ("string", {"value": "baz"})
+
+
+def test_equal_weight_route_precedence_with_uuid_crossing() -> None:
+    value = "00000000-0000-0000-0000-000000000000"
+    rule_map = r.Map(
+        [
+            r.Rule("/<string:value>/<uuid:id>", endpoint="str_uuid"),
+            r.Rule("/<uuid:id>/<string:value>", endpoint="uuid_str"),
+            r.Rule("/<uuid:id>", endpoint="uuid"),
+            r.Rule("/<string:value>", endpoint="string"),
+        ]
+    )
+    adapter = rule_map.bind("example.org", "/")
+    assert adapter.match(f"/{value}/{value}") == (
+        "str_uuid",
+        {"value": value, "id": uuid.UUID(value)},
+    )
+    assert adapter.match(f"/{value}/not_a_uuid") == (
+        "uuid_str",
+        {"id": uuid.UUID(value), "value": "not_a_uuid"},
+    )
+    assert adapter.match(f"/{value}") == ("uuid", {"id": uuid.UUID(value)})
+    assert adapter.match("/not_a_uuid") == ("string", {"value": "not_a_uuid"})
+
+
+def test_equal_weight_exact_match_beats_optional_slash_redirect() -> None:
+    for rules in (
+        [
+            r.Rule("/<string:value>", endpoint="straight"),
+            r.Rule("/<any(foo, bar):value>/", endpoint="slash"),
+        ],
+        [
+            r.Rule("/<any(foo, bar):value>/", endpoint="slash"),
+            r.Rule("/<string:value>", endpoint="straight"),
+        ],
+    ):
+        adapter = r.Map(rules).bind("example.org", "/")
+        assert adapter.match("/foo") == ("straight", {"value": "foo"})
+        assert adapter.match("/foo/") == ("slash", {"value": "foo"})
+
+
 def test_part_converter_order():
     """Match groups within a single part are sorted numerically.
 

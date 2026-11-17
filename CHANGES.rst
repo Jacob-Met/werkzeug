@@ -3,6 +3,10 @@
 Version 3.2.0
 -------------
 
+-   Make route priority stable across unrelated dynamic prefixes. When
+    converters have equal weights, match deeper static paths first, then
+    preserve rule registration order. :issue:`3156`
+
 -   Drop support for Python 3.9 and 3.10. :pr:`3098`
 -   Remove previous deprecated code: :pr:`3099`
 

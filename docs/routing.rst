@@ -120,7 +120,15 @@ a static domain part take priority over a variable part.
 
 Rules may end up with the same priority, by having static parts with the same
 length, and dynamic parts with the same weight, in the same positions. In this
-case, sorting is stable, so rules added earlier take priority.
+case, sorting is stable, so rules added earlier take priority. Equal-weight
+variable parts are compared by their remaining path: a subsequent static part
+takes priority over a variable part. When all parts have equal priority, the
+earliest registered matching rule wins, even if unrelated rules share a
+variable prefix.
+
+.. versionchanged:: 3.2
+    Rules with equal-weight converters are matched independently of unrelated
+    registrations that share dynamic prefixes.
 
 The exact way that rules are sorted internally is pretty complicated, but the
 result should be that you can rely on more specific rules matching before more

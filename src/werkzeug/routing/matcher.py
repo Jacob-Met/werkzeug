@@ -12,6 +12,9 @@ from .exceptions import RequestAliasRedirect
 from .exceptions import RequestPath
 from .rules import Rule
 from .rules import RulePart
+from .rules import Weighting
+
+MatchPriority = tuple[tuple[int, Weighting | None], ...]
 
 
 class SlashRequired(Exception):
@@ -27,6 +30,8 @@ class State:
     """
 
     dynamic: list[tuple[RulePart, State]] = field(default_factory=list)
+    dynamic_suffix_min: list[int] = field(default_factory=list)
+    min_rule_order: int = 0
     rules: list[Rule] = field(default_factory=list)
     static: dict[str, State] = field(default_factory=dict)
 
@@ -34,6 +39,7 @@ class State:
 class StateMachineMatcher:
     def __init__(self, merge_slashes: bool) -> None:
         self._root = State()
+        self._rule_order: dict[int, int] = {}
         self.merge_slashes = merge_slashes
 
     def add(self, rule: Rule) -> None:
@@ -57,6 +63,7 @@ class StateMachineMatcher:
                 raise DuplicateRuleError(existing, rule)
 
         state.rules.append(rule)
+        self._rule_order[id(rule)] = len(self._rule_order)
 
     def update(self) -> None:
         # For every state the dynamic transitions should be sorted by
@@ -69,6 +76,18 @@ class StateMachineMatcher:
                 _update_state(new_state)
             for _, new_state in state.dynamic:
                 _update_state(new_state)
+
+            min_order = len(self._rule_order)
+            for rule in state.rules:
+                min_order = min(min_order, self._rule_order[id(rule)])
+            for new_state in state.static.values():
+                min_order = min(min_order, new_state.min_rule_order)
+            suffix_min = len(self._rule_order)
+            state.dynamic_suffix_min = [suffix_min] * len(state.dynamic)
+            for index in range(len(state.dynamic) - 1, -1, -1):
+                suffix_min = min(suffix_min, state.dynamic[index][1].min_rule_order)
+                state.dynamic_suffix_min[index] = suffix_min
+            state.min_rule_order = min(min_order, suffix_min)
 
         _update_state(state)
 
@@ -84,7 +103,7 @@ class StateMachineMatcher:
 
         def _match(
             state: State, parts: list[str], values: list[str]
-        ) -> tuple[Rule, list[str]] | None:
+        ) -> tuple[Rule, list[str], MatchPriority] | None:
             # This function is meant to be called recursively, and will attempt
             # to match the head part to the state's transitions.
             nonlocal have_match_for, websocket_mismatch
@@ -100,7 +119,7 @@ class StateMachineMatcher:
                     elif rule.websocket != websocket:
                         websocket_mismatch = True
                     else:
-                        return rule, values
+                        return rule, values, ()
 
                 # Test if there is a match with this path with a
                 # trailing slash, if so raise an exception to report
@@ -113,7 +132,7 @@ class StateMachineMatcher:
                             if rule.strict_slashes:
                                 raise SlashRequired()
                             else:
-                                return rule, values
+                                return rule, values, ()
                 return None
 
             part = parts[0]
@@ -121,10 +140,26 @@ class StateMachineMatcher:
             if part in state.static:
                 rv = _match(state.static[part], parts[1:], values)
                 if rv is not None:
-                    return rv
+                    return rv[0], rv[1], ((0, None), *rv[2])
             # No match via the static transitions, so try the dynamic
-            # ones.
-            for test_part, new_state in state.dynamic:
+            # ones. When equal-weight transitions both match, their
+            # descendants determine priority; a shared prefix of an
+            # unrelated rule must not decide which endpoint wins.
+            best: tuple[Rule, list[str], MatchPriority] | None = None
+            best_weight = None
+            redirect_needed = False
+            for index, (test_part, new_state) in enumerate(state.dynamic):
+                if best is not None and test_part.weight != best_weight:
+                    break
+                # A terminal match already registered before any remaining
+                # competing rule cannot be overtaken at this path depth.
+                if (
+                    best is not None
+                    and len(parts) == 1
+                    and len(best[2]) == 1
+                    and self._rule_order[id(best[0])] <= state.dynamic_suffix_min[index]
+                ):
+                    break
                 target = part
                 remaining = parts[1:]
                 # A final part indicates a transition that always
@@ -151,9 +186,25 @@ class StateMachineMatcher:
                         key=lambda item: int(item[0][11:]),
                     )
                     groups = [item[1] for item in converter_groups]
-                    rv = _match(new_state, remaining, values + groups)
-                    if rv is not None:
-                        return rv
+                    try:
+                        rv = _match(new_state, remaining, values + groups)
+                    except SlashRequired:
+                        # Keep looking for an exact match. An alternative that
+                        # only matches after adding a slash is a fallback.
+                        redirect_needed = True
+                        continue
+                    if rv is not None and (
+                        best is None
+                        or (rv[2], self._rule_order[id(rv[0])])
+                        < (best[2][1:], self._rule_order[id(best[0])])
+                    ):
+                        best = rv[0], rv[1], ((1, test_part.weight), *rv[2])
+                        best_weight = test_part.weight
+
+            if best is not None:
+                return best
+            if redirect_needed:
+                raise SlashRequired()
 
             # If there is no match and the only part left is a
             # trailing slash ("") consider rules that aren't
@@ -168,7 +219,7 @@ class StateMachineMatcher:
                     elif rule.websocket != websocket:
                         websocket_mismatch = True
                     else:
-                        return rule, values
+                        return rule, values, ()
 
             return None
 
@@ -189,7 +240,7 @@ class StateMachineMatcher:
             else:
                 raise RequestPath(f"{path}")
         elif rv is not None:
-            rule, values = rv
+            rule, values, _priority = rv
 
             result = {}
             for name, value in zip(rule._converters.keys(), values, strict=True):
